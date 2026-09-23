@@ -12,99 +12,96 @@ app.config["MAX_CONTENT_LENGTH"] = 30 * 1024 * 1024
 
 
 # -----------------------------
-# rembg 引擎状态
+# rembg 引擎
 # -----------------------------
 
 engine = {
     "ready": False,
+    "loading": False,
     "error": None,
     "remove": None,
     "session": None,
 }
 
+engine_lock = threading.Lock()
 
-def load_background_engine():
+
+def ensure_background_engine():
     """
-    低资源模式加载 rembg，
-    适配 Render Free 0.1 CPU / 512MB RAM。
+    在当前 Gunicorn worker 中按需加载模型。
+    第一次处理时加载，之后复用。
     """
-    try:
-        import onnxruntime as ort
-        from rembg import remove, new_session
 
-        print("Starting background engine...", flush=True)
+    if engine["ready"]:
+        return True
 
-        sess_opts = ort.SessionOptions()
+    with engine_lock:
 
-        # Render Free CPU 很弱，限制线程
-        sess_opts.intra_op_num_threads = 1
-        sess_opts.inter_op_num_threads = 1
+        # 等锁期间，其他请求可能已经加载完成
+        if engine["ready"]:
+            return True
 
-        # 使用串行执行
-        sess_opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-
-        # 禁用昂贵的图优化，减少模型初始化时间
-        sess_opts.graph_optimization_level = (
-            ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-        )
-
-        session = new_session(
-            "u2netp",
-            sess_opts=sess_opts,
-            providers=["CPUExecutionProvider"]
-        )
-
-        engine["remove"] = remove
-        engine["session"] = session
-        engine["ready"] = True
+        engine["loading"] = True
         engine["error"] = None
 
-        print("Background removal engine is ready.", flush=True)
+        try:
+            import onnxruntime as ort
+            from rembg import remove, new_session
 
-    except Exception as e:
-        engine["ready"] = False
-        engine["error"] = str(e)
+            print("Loading background engine...", flush=True)
 
-        print(
-            "Background engine failed:",
-            str(e),
-            flush=True
-        )
-    """
-    后台加载 rembg。
-    不阻塞 Flask / Gunicorn 启动。
-    """
-    try:
-        from rembg import remove, new_session
+            sess_opts = ort.SessionOptions()
+            sess_opts.intra_op_num_threads = 1
+            sess_opts.inter_op_num_threads = 1
 
-        # 使用轻量模型，更适合 Render Free
-        session = new_session("u2netp")
+            sess_opts.execution_mode = (
+                ort.ExecutionMode.ORT_SEQUENTIAL
+            )
 
-        engine["remove"] = remove
-        engine["session"] = session
-        engine["ready"] = True
-        engine["error"] = None
+            sess_opts.graph_optimization_level = (
+                ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+            )
 
-        print("Background removal engine is ready.")
+            session = new_session(
+                "u2netp",
+                sess_opts=sess_opts,
+                providers=["CPUExecutionProvider"]
+            )
 
-    except Exception as e:
-        engine["ready"] = False
-        engine["error"] = str(e)
-        print("Background engine failed:", str(e))
+            engine["remove"] = remove
+            engine["session"] = session
+            engine["ready"] = True
+            engine["loading"] = False
+            engine["error"] = None
 
+            print(
+                "Background removal engine is ready.",
+                flush=True
+            )
 
-# 后台线程加载模型
-threading.Thread(
-    target=load_background_engine,
-    daemon=True
-).start()
+            return True
+
+        except Exception as e:
+
+            engine["ready"] = False
+            engine["loading"] = False
+            engine["error"] = str(e)
+
+            print(
+                "Background engine failed:",
+                str(e),
+                flush=True
+            )
+
+            return False
 
 
 # -----------------------------
-# 颜色处理
+# 颜色
 # -----------------------------
 
 def normalize_hex_color(color: str) -> str:
+
     if not color:
         return "#FFFFFF"
 
@@ -120,7 +117,10 @@ def normalize_hex_color(color: str) -> str:
 
 
 def hex_to_rgb(hex_color: str):
-    hex_color = normalize_hex_color(hex_color).lstrip("#")
+
+    hex_color = normalize_hex_color(
+        hex_color
+    ).lstrip("#")
 
     return tuple(
         int(hex_color[i:i + 2], 16)
@@ -134,20 +134,43 @@ def hex_to_rgb(hex_color: str):
 
 @app.get("/")
 def home():
+
     return jsonify({
         "name": "FANXI Image Engine",
-        "status": "running",
-        "background_engine_ready": engine["ready"]
+        "status": "running"
     })
 
 
 @app.get("/health")
 def health():
+
     return jsonify({
         "status": "ok",
         "background_engine_ready": engine["ready"],
+        "background_engine_loading": engine["loading"],
         "engine_error": engine["error"]
     })
+
+
+@app.get("/warmup")
+def warmup():
+    """
+    手动让当前服务进程加载模型。
+    """
+
+    success = ensure_background_engine()
+
+    if success:
+        return jsonify({
+            "success": True,
+            "background_engine_ready": True
+        })
+
+    return jsonify({
+        "success": False,
+        "background_engine_ready": False,
+        "error": engine["error"]
+    }), 500
 
 
 # -----------------------------
@@ -158,35 +181,47 @@ def health():
 def process_image():
 
     if "file" not in request.files:
+
         return jsonify({
             "success": False,
             "error": "No image uploaded"
         }), 400
 
-    if not engine["ready"]:
-        return jsonify({
-            "success": False,
-            "error": "Background engine is warming up",
-            "engine_error": engine["error"]
-        }), 503
-
     file = request.files["file"]
 
     if not file.filename:
+
         return jsonify({
             "success": False,
             "error": "Empty filename"
         }), 400
 
+
+    # 第一次真正处理时加载模型
+    if not ensure_background_engine():
+
+        return jsonify({
+            "success": False,
+            "error": "Background engine failed",
+            "engine_error": engine["error"]
+        }), 500
+
+
     bg_color = normalize_hex_color(
-        request.form.get("bg_color", "#FFFFFF")
+        request.form.get(
+            "bg_color",
+            "#FFFFFF"
+        )
     )
 
     try:
 
         image = Image.open(file.stream)
+
         image = ImageOps.exif_transpose(image)
+
         image = image.convert("RGBA")
+
 
         input_buffer = BytesIO()
 
@@ -199,15 +234,17 @@ def process_image():
 
         input_bytes = input_buffer.getvalue()
 
-        # 真正去背景
+
         removed_bytes = engine["remove"](
             input_bytes,
             session=engine["session"]
         )
 
+
         subject = Image.open(
             BytesIO(removed_bytes)
         ).convert("RGBA")
+
 
         rgb = hex_to_rgb(bg_color)
 
@@ -217,10 +254,12 @@ def process_image():
             rgb + (255,)
         )
 
+
         result = Image.alpha_composite(
             background,
             subject
         )
+
 
         output = BytesIO()
 
@@ -232,6 +271,7 @@ def process_image():
         )
 
         output.seek(0)
+
 
         return send_file(
             output,
