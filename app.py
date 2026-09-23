@@ -25,6 +25,52 @@ engine = {
 
 def load_background_engine():
     """
+    低资源模式加载 rembg，
+    适配 Render Free 0.1 CPU / 512MB RAM。
+    """
+    try:
+        import onnxruntime as ort
+        from rembg import remove, new_session
+
+        print("Starting background engine...", flush=True)
+
+        sess_opts = ort.SessionOptions()
+
+        # Render Free CPU 很弱，限制线程
+        sess_opts.intra_op_num_threads = 1
+        sess_opts.inter_op_num_threads = 1
+
+        # 使用串行执行
+        sess_opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+
+        # 禁用昂贵的图优化，减少模型初始化时间
+        sess_opts.graph_optimization_level = (
+            ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        )
+
+        session = new_session(
+            "u2netp",
+            sess_opts=sess_opts,
+            providers=["CPUExecutionProvider"]
+        )
+
+        engine["remove"] = remove
+        engine["session"] = session
+        engine["ready"] = True
+        engine["error"] = None
+
+        print("Background removal engine is ready.", flush=True)
+
+    except Exception as e:
+        engine["ready"] = False
+        engine["error"] = str(e)
+
+        print(
+            "Background engine failed:",
+            str(e),
+            flush=True
+        )
+    """
     后台加载 rembg。
     不阻塞 Flask / Gunicorn 启动。
     """
