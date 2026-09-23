@@ -53,7 +53,7 @@ def process_image():
         image = image.convert("RGBA")
 
         output = BytesIO()
-        image.save(output, format="PNG")
+        image.save(output, format="PNG", optimize=False, compress_level=1)
         output.seek(0)
 
         return send_file(
