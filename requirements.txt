@@ -2,3 +2,6 @@ Flask
 flask-cors
 Pillow
 gunicorn
+rembg
+onnxruntime
+numpy
